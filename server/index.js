@@ -1,0 +1,50 @@
+import dotenv from 'dotenv';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: join(__dirname, '..', '.env') });
+
+import express from 'express';
+import cors from 'cors';
+import { existsSync } from 'fs';
+import { createSession } from './lib/session.js';
+import authRoutes from './routes/auth.js';
+import cardsRoutes from './routes/cards.js';
+import mediaRoutes from './routes/media.js';
+import publishRoutes from './routes/publish.js';
+
+const app = express();
+const PORT = process.env.PORT || 3001;
+
+// Trust proxy for secure cookies behind Render's proxy
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
+
+app.use(cors({
+  origin: process.env.CLIENT_URL || 'http://localhost:5173',
+  credentials: true,
+}));
+
+app.use(express.json());
+app.use(createSession());
+
+// API routes
+app.use(authRoutes);
+app.use(cardsRoutes);
+app.use(mediaRoutes);
+app.use(publishRoutes);
+
+// Serve static client in production
+const clientDist = join(__dirname, '..', 'client', 'dist');
+if (process.env.NODE_ENV === 'production' && existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get('*', (req, res) => {
+    res.sendFile(join(clientDist, 'index.html'));
+  });
+}
+
+app.listen(PORT, () => {
+  console.log(`CardForge server running on port ${PORT}`);
+});
