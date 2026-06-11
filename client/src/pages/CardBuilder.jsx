@@ -10,7 +10,7 @@ import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../hooks/useToast';
 
 const EMPTY_PROMPT = { hashtag: '', tweetText: '' };
-const MIN_PROMPTS = 2;
+const MIN_PROMPTS = 1;
 
 export default function CardBuilder() {
   const { id } = useParams();
@@ -39,7 +39,7 @@ export default function CardBuilder() {
   const [coverMediaType, setCoverMediaType] = useState(null);
   const [mediaPreviewUrl, setMediaPreviewUrl] = useState(null);
   const [coverPreviewUrl, setCoverPreviewUrl] = useState(null);
-  const [prompts, setPrompts] = useState([{ ...EMPTY_PROMPT }, { ...EMPTY_PROMPT }]);
+  const [prompts, setPrompts] = useState([{ ...EMPTY_PROMPT }]);
   const [thankYouText, setThankYouText] = useState('');
   const [thankYouUrl, setThankYouUrl] = useState('');
   const [postText, setPostText] = useState('');
@@ -65,7 +65,7 @@ export default function CardBuilder() {
             hashtag: p.hashtag || '',
             tweetText: p.tweetText || p.headline || '',
           }))
-        : [{ ...EMPTY_PROMPT }, { ...EMPTY_PROMPT }];
+        : [{ ...EMPTY_PROMPT }];
       while (loadedPrompts.length < MIN_PROMPTS) loadedPrompts.push({ ...EMPTY_PROMPT });
       setPrompts(loadedPrompts);
       setThankYouText(existingCard.thank_you_text || '');
@@ -135,7 +135,7 @@ export default function CardBuilder() {
     if (s === 0) {
       if (!mediaId) return 'Upload card media before continuing.';
       if (!name.trim()) return 'Enter a card name before continuing.';
-      if (!headline.trim()) return 'Enter a headline before continuing.';
+      if (!headline.trim() && prompts.length < 2) return 'Enter a headline before continuing.';
       const mainIsImage = mediaType && !mediaType.includes('video');
       const coverIsVideo = coverMediaType && coverMediaType.includes('video');
       if (enableCover && mainIsImage && coverIsVideo) {
@@ -143,13 +143,11 @@ export default function CardBuilder() {
       }
     }
     if (s === 1) {
-      // First two CTAs are required
-      for (let i = 0; i < MIN_PROMPTS; i++) {
-        if (!prompts[i]?.hashtag?.trim()) return `CTA ${i + 1} hashtag is required.`;
-        if (!prompts[i]?.tweetText?.trim()) return `CTA ${i + 1} post prompt text is required.`;
-      }
-      // Additional CTAs: if either field is filled, both must be filled
-      for (let i = MIN_PROMPTS; i < prompts.length; i++) {
+      // First CTA is always required
+      if (!prompts[0]?.hashtag?.trim()) return 'CTA 1 hashtag is required.';
+      if (!prompts[0]?.tweetText?.trim()) return 'CTA 1 post prompt text is required.';
+      // CTAs 2-4: optional, but if either field is filled, both must be filled
+      for (let i = 1; i < prompts.length; i++) {
         const has = prompts[i]?.hashtag?.trim() || prompts[i]?.tweetText?.trim();
         if (has) {
           if (!prompts[i]?.hashtag?.trim()) return `CTA ${i + 1} hashtag is required when post prompt is set.`;
@@ -404,14 +402,17 @@ export default function CardBuilder() {
                   onChange={(e) => setHeadline(e.target.value.slice(0, 70))}
                   maxLength={70}
                   placeholder="Card headline shown to users"
-                  className="w-full bg-x-black border border-x-border rounded-lg px-4 py-3 text-sm text-x-text placeholder:text-x-secondary/50 focus:border-x-blue focus:outline-none transition-colors"
+                  disabled={prompts.length >= 2}
+                  className={`w-full bg-x-black border border-x-border rounded-lg px-4 py-3 text-sm text-x-text placeholder:text-x-secondary/50 focus:border-x-blue focus:outline-none transition-colors ${prompts.length >= 2 ? 'opacity-40 cursor-not-allowed' : ''}`}
                 />
                 <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-x-secondary">
                   {headline.length}/70
                 </span>
               </div>
               <p className="text-xs text-x-secondary">
-                Displayed on the card — maps to the card title
+                {prompts.length >= 2
+                  ? 'Headline is not supported when using multiple CTAs — the X API treats them as mutually exclusive.'
+                  : 'Displayed on the card — maps to the card title'}
               </p>
             </div>
 
@@ -436,7 +437,7 @@ export default function CardBuilder() {
                 CTA Buttons
               </h3>
               <p className="text-xs text-x-secondary -mt-2">
-                Each CTA creates a "Post #hashtag" button on the card. At least 2 required.
+                Each CTA creates a "Post #hashtag" button on the card. At least 1 required.
               </p>
 
               {prompts.map((prompt, i) => (

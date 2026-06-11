@@ -53,11 +53,11 @@ router.post('/api/publish', async (req, res) => {
     if (!card.media_key) {
       return res.status(400).json({ error: 'Card media is required before publishing.' });
     }
-    if (!card.headline?.trim()) {
-      return res.status(400).json({ error: 'Headline is required before publishing.' });
+    if (validPrompts.length < 1) {
+      return res.status(400).json({ error: 'At least one CTA with a hashtag and post prompt is required.' });
     }
-    if (validPrompts.length < 2) {
-      return res.status(400).json({ error: 'At least two CTAs with a hashtag and post prompt are required.' });
+    if (validPrompts.length < 2 && !card.headline?.trim()) {
+      return res.status(400).json({ error: 'Headline is required when using a single CTA.' });
     }
     if (!card.thank_you_text?.trim()) {
       return res.status(400).json({ error: 'Thank you text is required before publishing.' });
@@ -72,7 +72,9 @@ router.post('/api/publish', async (req, res) => {
       const cardPayload = {};
 
       if (card.name) cardPayload.name = card.name;
-      cardPayload.title = card.headline;
+      if (validPrompts.length < 2 && card.headline) {
+        cardPayload.title = card.headline;
+      }
       cardPayload.media_key = mediaKey;
 
       // Cover / unlocked media (pre-engagement display)
