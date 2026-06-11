@@ -30,20 +30,23 @@ app.use(cors({
 app.use(express.json());
 app.use(createSession());
 
+// Serve static client in production (before API routes so requireAuth doesn't block them)
+const clientDist = join(__dirname, '..', 'client', 'dist');
+if (process.env.NODE_ENV === 'production' && existsSync(clientDist)) {
+  app.use(express.static(clientDist));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/auth')) {
+      return next();
+    }
+    res.sendFile(join(clientDist, 'index.html'));
+  });
+}
+
 // API routes
 app.use(authRoutes);
 app.use(cardsRoutes);
 app.use(mediaRoutes);
 app.use(publishRoutes);
-
-// Serve static client in production
-const clientDist = join(__dirname, '..', 'client', 'dist');
-if (process.env.NODE_ENV === 'production' && existsSync(clientDist)) {
-  app.use(express.static(clientDist));
-  app.get('*', (req, res) => {
-    res.sendFile(join(clientDist, 'index.html'));
-  });
-}
 
 app.listen(PORT, () => {
   console.log(`CardForge server running on port ${PORT}`);
