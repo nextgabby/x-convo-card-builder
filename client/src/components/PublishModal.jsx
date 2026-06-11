@@ -128,10 +128,11 @@ function CardPreview({ card, prompts, previewTab, setPreviewTab }) {
   );
 }
 
-export default function PublishModal({ card, user, onConfirm, onCancel, publishResult, onDashboard }) {
+export default function PublishModal({ card, user, isDraft, onConfirm, onCancel, publishResult, onDashboard }) {
   const [publishing, setPublishing] = useState(false);
   const [error, setError] = useState(null);
   const [previewTab, setPreviewTab] = useState('before');
+  const [copied, setCopied] = useState(false);
   const prompts = card.prompts || [];
 
   const handleConfirm = async () => {
@@ -163,10 +164,10 @@ export default function PublishModal({ card, user, onConfirm, onCancel, publishR
                   <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                 </svg>
               </div>
-              <h2 className="text-lg font-semibold text-x-text">Published!</h2>
+              <h2 className="text-lg font-semibold text-x-text">{isDraft ? 'Card Created' : 'Published!'}</h2>
             </div>
 
-            {publishResult.tweetId && (
+            {!isDraft && publishResult.tweetId && (
               <div className="bg-x-black rounded-xl border border-x-border p-4 space-y-2">
                 <span className="text-xs text-x-secondary uppercase tracking-wider">Post</span>
                 <a
@@ -183,9 +184,21 @@ export default function PublishModal({ card, user, onConfirm, onCancel, publishR
             {publishResult.cardUri && (
               <div className="bg-x-black rounded-xl border border-x-border p-4 space-y-2">
                 <span className="text-xs text-x-secondary uppercase tracking-wider">Card URI</span>
-                <p className="text-sm text-x-text font-mono break-all select-all">
-                  {publishResult.cardUri}
-                </p>
+                <div className="flex items-center gap-2">
+                  <p className="text-sm text-x-text font-mono break-all select-all flex-1">
+                    {publishResult.cardUri}
+                  </p>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(publishResult.cardUri);
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 2000);
+                    }}
+                    className="shrink-0 text-xs text-x-blue hover:underline"
+                  >
+                    {copied ? 'Copied!' : 'Copy'}
+                  </button>
+                </div>
               </div>
             )}
 
@@ -195,47 +208,53 @@ export default function PublishModal({ card, user, onConfirm, onCancel, publishR
           </div>
         ) : (
           <div className="p-6 space-y-5">
-            <h2 className="text-lg font-semibold text-x-text">Confirm & Publish</h2>
+            <h2 className="text-lg font-semibold text-x-text">
+              {isDraft ? 'Create Conversation Card' : 'Confirm & Publish'}
+            </h2>
 
-            {/* Tweet + Card preview */}
-            <div className="bg-x-black rounded-xl border border-x-border overflow-hidden">
-              {/* Tweet header */}
-              <div className="p-4 pb-3">
-                <div className="flex items-start gap-3">
-                  {user?.profileImageUrl ? (
-                    <img
-                      src={user.profileImageUrl}
-                      alt=""
-                      className="w-10 h-10 rounded-full shrink-0"
-                    />
-                  ) : (
-                    <div className="w-10 h-10 rounded-full bg-x-border shrink-0" />
-                  )}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1">
-                      <span className="text-sm font-semibold text-x-text">
-                        {user?.name || 'You'}
-                      </span>
-                      <span className="text-sm text-x-secondary">
-                        @{user?.username || 'handle'}
-                      </span>
+            {/* Card preview (draft) or Tweet + Card preview (publish) */}
+            {isDraft ? (
+              <CardPreview card={card} prompts={prompts} previewTab={previewTab} setPreviewTab={setPreviewTab} />
+            ) : (
+              <div className="bg-x-black rounded-xl border border-x-border overflow-hidden">
+                {/* Tweet header */}
+                <div className="p-4 pb-3">
+                  <div className="flex items-start gap-3">
+                    {user?.profileImageUrl ? (
+                      <img
+                        src={user.profileImageUrl}
+                        alt=""
+                        className="w-10 h-10 rounded-full shrink-0"
+                      />
+                    ) : (
+                      <div className="w-10 h-10 rounded-full bg-x-border shrink-0" />
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1">
+                        <span className="text-sm font-semibold text-x-text">
+                          {user?.name || 'You'}
+                        </span>
+                        <span className="text-sm text-x-secondary">
+                          @{user?.username || 'handle'}
+                        </span>
+                      </div>
+                      <p className="text-sm text-x-text mt-1 whitespace-pre-wrap break-words">
+                        {previewTab === 'after'
+                          ? (prompts.find(p => p.tweetText || p.hashtag)
+                              ? `${prompts[0].tweetText || ''} ${prompts[0].hashtag || ''}`.trim() || 'No post text'
+                              : 'No post text')
+                          : (card.postText || 'No post text')}
+                      </p>
                     </div>
-                    <p className="text-sm text-x-text mt-1 whitespace-pre-wrap break-words">
-                      {previewTab === 'after'
-                        ? (prompts.find(p => p.tweetText || p.hashtag)
-                            ? `${prompts[0].tweetText || ''} ${prompts[0].hashtag || ''}`.trim() || 'No post text'
-                            : 'No post text')
-                        : (card.postText || 'No post text')}
-                    </p>
                   </div>
                 </div>
-              </div>
 
-              {/* Embedded card preview */}
-              <div className="mx-4 mb-4">
-                <CardPreview card={card} prompts={prompts} previewTab={previewTab} setPreviewTab={setPreviewTab} />
+                {/* Embedded card preview */}
+                <div className="mx-4 mb-4">
+                  <CardPreview card={card} prompts={prompts} previewTab={previewTab} setPreviewTab={setPreviewTab} />
+                </div>
               </div>
-            </div>
+            )}
 
             {error && (
               <div className="bg-x-red/10 border border-x-red/20 rounded-lg px-4 py-3 text-sm text-x-red">
@@ -248,7 +267,9 @@ export default function PublishModal({ card, user, onConfirm, onCancel, publishR
                 Cancel
               </XButton>
               <XButton onClick={handleConfirm} disabled={publishing}>
-                {publishing ? 'Publishing...' : 'Confirm & Publish'}
+                {publishing
+                  ? (isDraft ? 'Creating...' : 'Publishing...')
+                  : (isDraft ? 'Create Card' : 'Confirm & Publish')}
               </XButton>
             </div>
           </div>

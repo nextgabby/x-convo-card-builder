@@ -24,10 +24,13 @@ function ensureMediaKeyPrefix(key, mediaType) {
 
 router.post('/api/publish', async (req, res) => {
   try {
-    const { cardId, postText, promotedOnly } = req.body;
+    const { cardId, postText, promotedOnly, draft } = req.body;
 
-    if (!cardId || !postText) {
-      return res.status(400).json({ error: 'cardId and postText are required' });
+    if (!cardId) {
+      return res.status(400).json({ error: 'cardId is required' });
+    }
+    if (!draft && !postText) {
+      return res.status(400).json({ error: 'postText is required when publishing' });
     }
 
     const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.session.userId);
@@ -132,6 +135,12 @@ router.post('/api/publish', async (req, res) => {
 
     if (!cardUri) {
       return res.status(500).json({ error: 'Conversation card creation failed. Cannot publish without a card.' });
+    }
+
+    // Draft mode: card created on X, skip tweet creation
+    if (draft) {
+      db.prepare('UPDATE cards SET updated_at = unixepoch() WHERE id = ?').run(card.id);
+      return res.json({ ok: true, cardUri });
     }
 
     // Create tweet via Ads API with the card_uri attached

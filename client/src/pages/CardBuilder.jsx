@@ -157,7 +157,7 @@ export default function CardBuilder() {
       if (!thankYouText.trim()) return 'Thank you text is required.';
     }
     if (s === 2) {
-      if (!postText.trim()) return 'Enter post text before publishing.';
+      if (publishOption !== 'draft' && !postText.trim()) return 'Enter post text before publishing.';
     }
     return null;
   };
@@ -224,30 +224,24 @@ export default function CardBuilder() {
       body: JSON.stringify(getFormData()),
     });
 
-    if (publishOption === 'draft') {
-      addToast('Card saved as draft', 'success');
-      navigate('/dashboard');
-      return;
-    }
-
     setShowPublishModal(true);
   };
 
   const handleConfirmPublish = async () => {
+    const isDraft = publishOption === 'draft';
     const res = await fetch('/api/publish', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
-      body: JSON.stringify({
-        cardId,
-        postText,
-        promotedOnly,
-      }),
+      body: JSON.stringify(isDraft
+        ? { cardId, draft: true }
+        : { cardId, postText, promotedOnly }
+      ),
     });
 
     if (!res.ok) {
       const data = await res.json();
-      throw new Error(data.error || 'Publish failed');
+      throw new Error(data.error || (isDraft ? 'Card creation failed' : 'Publish failed'));
     }
 
     const data = await res.json();
@@ -711,6 +705,7 @@ export default function CardBuilder() {
             hasCover: enableCover && !!coverMediaId,
           }}
           user={user}
+          isDraft={publishOption === 'draft'}
           onConfirm={handleConfirmPublish}
           onCancel={() => setShowPublishModal(false)}
           publishResult={publishResult}
