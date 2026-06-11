@@ -32,7 +32,11 @@ app.use(createSession());
 
 // Serve static client in production (before API routes so requireAuth doesn't block them)
 const clientDist = join(__dirname, '..', 'client', 'dist');
+console.log('[Startup] NODE_ENV:', process.env.NODE_ENV);
+console.log('[Startup] clientDist path:', clientDist);
+console.log('[Startup] clientDist exists:', existsSync(clientDist));
 if (process.env.NODE_ENV === 'production' && existsSync(clientDist)) {
+  console.log('[Startup] Serving static files from', clientDist);
   app.use(express.static(clientDist));
   app.get('*', (req, res, next) => {
     if (req.path.startsWith('/api') || req.path.startsWith('/auth')) {

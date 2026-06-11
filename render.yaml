@@ -2,7 +2,7 @@ services:
   - type: web
     name: cardforge
     env: node
-    buildCommand: npm install && cd client && npm install && npm run build && cd ../server && npm install
+    buildCommand: npm install --include=dev && cd client && npm install --include=dev && npm run build && cd ../server && npm install
     startCommand: node server/index.js
     envVars:
       - key: NODE_ENV
