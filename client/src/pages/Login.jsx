@@ -34,7 +34,7 @@ export default function Login() {
         <div className="space-y-2">
           <h1 className="text-4xl font-bold text-x-text tracking-tight">CardForge</h1>
           <p className="text-x-secondary text-lg">
-            Create and publish X Conversation Cards
+            Create and publish X Conversation Cards, Media Polls, and Collection Ads
           </p>
         </div>
 

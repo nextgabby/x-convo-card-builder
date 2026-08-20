@@ -3,13 +3,21 @@ import { useState } from 'react';
 export default function CardTile({ card, onClick, onEdit, onDuplicate }) {
   const [hovered, setHovered] = useState(false);
   const [imgFailed, setImgFailed] = useState(false);
+  const isPoll = (card.card_type || card.cardType) === 'poll';
+  const isCollection = (card.card_type || card.cardType) === 'collection';
   const prompts = card.prompts || [];
   const firstHashtag = prompts[0]?.hashtag;
+  const pollChoices = (card.pollChoices || []).map((choice) => choice.trim()).filter(Boolean);
   const date = new Date((card.created_at || 0) * 1000).toLocaleDateString('en-US', {
     month: 'short',
     day: 'numeric',
     year: 'numeric',
   });
+  const thumbUrl = card.media_preview_url?.startsWith('/api/')
+    ? card.media_preview_url
+    : card.media_id
+      ? `/api/media/preview/${card.media_id}`
+      : null;
 
   return (
     <div
@@ -23,9 +31,9 @@ export default function CardTile({ card, onClick, onEdit, onDuplicate }) {
     >
       {/* Media thumbnail */}
       <div className="aspect-video bg-x-black flex items-center justify-center overflow-hidden">
-        {card.media_preview_url && !imgFailed ? (
+        {thumbUrl && !imgFailed ? (
           <img
-            src={card.media_preview_url}
+            src={thumbUrl}
             alt=""
             className="w-full h-full object-cover"
             onError={() => setImgFailed(true)}
@@ -46,13 +54,21 @@ export default function CardTile({ card, onClick, onEdit, onDuplicate }) {
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1">
             <h3 className="text-x-text font-medium text-sm truncate">
-              {card.name || 'Untitled Card'}
+              {card.name || (isPoll ? 'Untitled Poll' : isCollection ? 'Untitled Collection' : 'Untitled Card')}
             </h3>
-            {firstHashtag && (
+            {isPoll ? (
+              <span className="text-x-secondary text-xs mt-1 inline-block">
+                Media Poll{pollChoices.length ? ` · ${pollChoices.slice(0, 2).join(' / ')}` : ''}
+              </span>
+            ) : isCollection ? (
+              <span className="text-x-secondary text-xs mt-1 inline-block">
+                Collection Ad{card.headline ? ` · ${card.headline}` : ''}
+              </span>
+            ) : firstHashtag ? (
               <span className="text-x-blue text-xs mt-1 inline-block">
                 {firstHashtag.startsWith('#') ? firstHashtag : `#${firstHashtag}`}
               </span>
-            )}
+            ) : null}
           </div>
           <span
             className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import NavBar from '../components/NavBar';
 import StepIndicator from '../components/StepIndicator';
 import MediaUploader from '../components/MediaUploader';
@@ -8,12 +8,71 @@ import XButton from '../components/XButton';
 import { useCard } from '../hooks/useCards';
 import { useAuth } from '../hooks/useAuth';
 import { useToast } from '../hooks/useToast';
+import { recropImageFromUrl } from '../lib/cropImage';
 
 const EMPTY_PROMPT = { hashtag: '', tweetText: '' };
 const MIN_PROMPTS = 1;
+const POLL_CHOICE_MAX = 25;
+const POLL_DURATION_MIN = 5;
+const POLL_DURATION_MAX = 10080;
+const EMPTY_COLLECTION_ITEM = { mediaId: null, mediaKey: null, mediaType: null, previewUrl: null };
+const COLLECTION_ITEM_MIN = 1;
+const COLLECTION_ITEM_MAX = 5;
+const COLLECTION_STEPS = ['Card Setup', 'Collection Items', 'Publish'];
+const POLL_STEPS = ['Card Setup', 'Poll Options', 'Publish'];
+const CONVO_STEPS = ['Card Setup', 'Engagement Prompts', 'Publish'];
+const POLL_DURATIONS = [
+  { label: '5 minutes', value: 5 },
+  { label: '1 hour', value: 60 },
+  { label: '6 hours', value: 360 },
+  { label: '1 day', value: 1440 },
+  { label: '3 days', value: 4320 },
+  { label: '7 days', value: 10080 },
+];
+
+async function uploadImageFile(file) {
+  const formData = new FormData();
+  formData.append('file', file);
+  const res = await fetch('/api/media/upload', {
+    method: 'POST',
+    credentials: 'include',
+    body: formData,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'Upload failed');
+  }
+  return res.json();
+}
+
+async function recropCollectionItemsToCover(items, coverIsVideo) {
+  const ratio = coverIsVideo ? '16:9' : '191:100';
+  const next = [];
+  for (const item of items) {
+    if (!item.mediaId) {
+      next.push(item);
+      continue;
+    }
+    const url = item.previewUrl || `/api/media/preview/${item.mediaId}`;
+    const { file, changed } = await recropImageFromUrl(url, ratio);
+    if (!changed) {
+      next.push(item);
+      continue;
+    }
+    const uploaded = await uploadImageFile(file);
+    next.push({
+      mediaId: uploaded.mediaId,
+      mediaKey: uploaded.mediaKey,
+      mediaType: uploaded.mediaType,
+      previewUrl: uploaded.previewUrl || `/api/media/preview/${uploaded.mediaId}`,
+    });
+  }
+  return next;
+}
 
 export default function CardBuilder() {
   const { id } = useParams();
+  const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const { user, handleUnauthorized } = useAuth();
   const { addToast } = useToast();
@@ -26,6 +85,7 @@ export default function CardBuilder() {
   const [validationError, setValidationError] = useState(null);
   const [publishResult, setPublishResult] = useState(null);
   const saveTimerRef = useRef(null);
+  const skipAutosaveRef = useRef(false);
 
   // Form state
   const [name, setName] = useState('');
@@ -45,6 +105,20 @@ export default function CardBuilder() {
   const [postText, setPostText] = useState('');
   const [promotedOnly, setPromotedOnly] = useState(true);
   const [publishOption, setPublishOption] = useState('immediate');
+  const [cardType, setCardType] = useState(
+    ['poll', 'collection'].includes(searchParams.get('type')) ? searchParams.get('type') : 'conversation'
+  );
+  const [pollChoices, setPollChoices] = useState(['', '']);
+  const [pollDurationMinutes, setPollDurationMinutes] = useState(1440);
+  const [mediaPollsEnabled, setMediaPollsEnabled] = useState(null);
+  const [collectionItems, setCollectionItems] = useState(
+    Array.from({ length: COLLECTION_ITEM_MAX }, () => ({ ...EMPTY_COLLECTION_ITEM }))
+  );
+  const [destinationUrl, setDestinationUrl] = useState('');
+
+  const isPoll = cardType === 'poll';
+  const isCollection = cardType === 'collection';
+  const isConversation = !isPoll && !isCollection;
 
   // Load existing card data
   useEffect(() => {
@@ -57,7 +131,18 @@ export default function CardBuilder() {
       setCoverMediaId(existingCard.cover_media_id || null);
       setCoverMediaKey(existingCard.cover_media_key || null);
       setCoverMediaType(existingCard.cover_media_type || null);
-      setMediaPreviewUrl(existingCard.media_preview_url || null);
+      setCoverPreviewUrl(
+        existingCard.cover_media_id
+          ? `/api/media/preview/${existingCard.cover_media_id}`
+          : null
+      );
+      setMediaPreviewUrl(
+        existingCard.media_preview_url?.startsWith('/api/')
+          ? existingCard.media_preview_url
+          : existingCard.media_id
+            ? `/api/media/preview/${existingCard.media_id}`
+            : null
+      );
       setEnableCover(!!existingCard.cover_media_key);
       // Map prompts — handle both old `headline` field and new `tweetText`
       const loadedPrompts = existingCard.prompts?.length > 0
@@ -78,8 +163,37 @@ export default function CardBuilder() {
           ? existingCard.promotedOnly
           : true
       );
+      setCardType(existingCard.card_type || existingCard.cardType || 'conversation');
+      const loadedChoices = existingCard.pollChoices?.length
+        ? existingCard.pollChoices.map((choice) => choice || '')
+        : ['', ''];
+      while (loadedChoices.length < 2) loadedChoices.push('');
+      setPollChoices(loadedChoices);
+      setPollDurationMinutes(existingCard.pollDurationMinutes || existingCard.poll_duration_minutes || 1440);
+      const loadedItems = existingCard.collectionItems?.length
+        ? existingCard.collectionItems.map((item) => ({
+            mediaId: item.mediaId || null,
+            mediaKey: item.mediaKey || null,
+            mediaType: item.mediaType || null,
+            previewUrl: item.previewUrl || null,
+          }))
+        : [];
+      while (loadedItems.length < COLLECTION_ITEM_MAX) loadedItems.push({ ...EMPTY_COLLECTION_ITEM });
+      setCollectionItems(loadedItems.slice(0, COLLECTION_ITEM_MAX));
+      setDestinationUrl(existingCard.destinationUrl || existingCard.destination_url || '');
     }
   }, [existingCard]);
+
+  useEffect(() => {
+    if (!isPoll) return;
+    fetch('/api/account/features', { credentials: 'include' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data) return;
+        setMediaPollsEnabled(!!data.mediaPolls);
+      })
+      .catch(() => {});
+  }, [isPoll]);
 
   // Unsaved changes warning
   useEffect(() => {
@@ -127,22 +241,62 @@ export default function CardBuilder() {
       thankYouUrl,
       postText,
       promotedOnly,
+      cardType,
+      pollChoices,
+      pollDurationMinutes,
+      collectionItems,
+      destinationUrl,
     }),
-    [name, headline, mediaId, mediaKey, mediaType, enableCover, coverMediaId, coverMediaKey, coverMediaType, mediaPreviewUrl, prompts, thankYouText, thankYouUrl, postText, promotedOnly]
+    [name, headline, mediaId, mediaKey, mediaType, enableCover, coverMediaId, coverMediaKey, coverMediaType, mediaPreviewUrl, prompts, thankYouText, thankYouUrl, postText, promotedOnly, cardType, pollChoices, pollDurationMinutes, collectionItems, destinationUrl]
   );
 
   const validate = (s) => {
     if (s === 0) {
-      if (!mediaId) return 'Upload card media before continuing.';
-      if (!name.trim()) return 'Enter a card name before continuing.';
-      if (!headline.trim() && prompts.length < 2) return 'Enter a headline before continuing.';
+      if (!mediaId) return isCollection ? 'Upload cover media before continuing.' : 'Upload card media before continuing.';
+      if (!name.trim()) {
+        if (isPoll) return 'Enter a poll name before continuing.';
+        if (isCollection) return 'Enter a collection name before continuing.';
+        return 'Enter a card name before continuing.';
+      }
+      if (isConversation && !headline.trim() && prompts.length < 2) return 'Enter a headline before continuing.';
+      if (isCollection && !headline.trim()) return 'Enter a collection title before continuing.';
+      if (isCollection) {
+        if (!destinationUrl.trim()) return 'Enter a https destination URL before continuing.';
+        try {
+          if (new URL(destinationUrl.trim()).protocol !== 'https:') return 'Destination URL must use https.';
+        } catch {
+          return 'Destination URL must be a valid https URL.';
+        }
+      }
       const mainIsImage = mediaType && !mediaType.includes('video');
       const coverIsVideo = coverMediaType && coverMediaType.includes('video');
-      if (enableCover && mainIsImage && coverIsVideo) {
+      if (isConversation && enableCover && mainIsImage && coverIsVideo) {
         return 'An image card cannot have a video cover. Use an image cover or change the main media to video.';
       }
     }
-    if (s === 1) {
+    if (s === 1 && isCollection) {
+      const filled = collectionItems.filter((item) => item.mediaId);
+      if (filled.length < COLLECTION_ITEM_MIN) return 'Upload at least one thumbnail image.';
+      if (filled.length > COLLECTION_ITEM_MAX) {
+        return `A collection ad can have at most ${COLLECTION_ITEM_MAX} thumbnail images.`;
+      }
+      const keys = [mediaKey, ...filled.map((item) => item.mediaKey)].filter(Boolean);
+      if (new Set(keys).size !== keys.length) {
+        return 'Each collection slide must use a different image.';
+      }
+    }
+    if (s === 1 && isPoll) {
+      const filled = pollChoices.map((choice) => choice.trim()).filter(Boolean);
+      if (filled.length < 2) return 'Enter at least two poll choices.';
+      if (filled.some((choice) => choice.length > POLL_CHOICE_MAX)) {
+        return `Each poll choice must be ${POLL_CHOICE_MAX} characters or fewer.`;
+      }
+      const duration = Number(pollDurationMinutes);
+      if (!Number.isInteger(duration) || duration < POLL_DURATION_MIN || duration > POLL_DURATION_MAX) {
+        return `Poll duration must be between ${POLL_DURATION_MIN} minutes and 7 days.`;
+      }
+    }
+    if (s === 1 && isConversation) {
       // First CTA is always required
       if (!prompts[0]?.hashtag?.trim()) return 'CTA 1 hashtag is required.';
       if (!prompts[0]?.tweetText?.trim()) return 'CTA 1 post prompt text is required.';
@@ -155,6 +309,15 @@ export default function CardBuilder() {
         }
       }
       if (!thankYouText.trim()) return 'Thank you text is required.';
+      if (thankYouUrl.trim()) {
+        try {
+          if (new URL(thankYouUrl.trim()).protocol !== 'https:') {
+            return 'Thank you URL must use https.';
+          }
+        } catch {
+          return 'Thank you URL must be a valid https URL.';
+        }
+      }
     }
     if (s === 2) {
       if (publishOption !== 'draft' && !postText.trim()) return 'Enter post text before publishing.';
@@ -164,7 +327,7 @@ export default function CardBuilder() {
 
   // Autosave with debounce
   const autosave = useCallback(async () => {
-    if (!cardId) return;
+    if (!cardId || skipAutosaveRef.current) return;
     try {
       setSaving(true);
       const res = await fetch(`/api/cards/${cardId}`, {
@@ -186,7 +349,7 @@ export default function CardBuilder() {
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(autosave, 500);
     return () => clearTimeout(saveTimerRef.current);
-  }, [name, headline, mediaId, mediaType, enableCover, coverMediaId, coverMediaType, prompts, thankYouText, thankYouUrl, autosave, cardId]);
+  }, [name, headline, mediaId, mediaType, enableCover, coverMediaId, coverMediaType, prompts, thankYouText, thankYouUrl, pollChoices, pollDurationMinutes, collectionItems, destinationUrl, autosave, cardId]);
 
   // Create card on first step transition if new
   const ensureCard = async () => {
@@ -229,23 +392,43 @@ export default function CardBuilder() {
 
   const handleConfirmPublish = async () => {
     const isDraft = publishOption === 'draft';
-    const res = await fetch('/api/publish', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      credentials: 'include',
-      body: JSON.stringify(isDraft
-        ? { cardId, draft: true }
-        : { cardId, postText, promotedOnly }
-      ),
-    });
+    skipAutosaveRef.current = true;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    try {
+      if (isCollection) {
+        const coverIsVideo = mediaType && mediaType.includes('video');
+        const items = await recropCollectionItemsToCover(collectionItems, coverIsVideo);
+        setCollectionItems(items);
+        const saveRes = await fetch(`/api/cards/${cardId}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'include',
+          body: JSON.stringify({ ...getFormData(), collectionItems: items }),
+        });
+        if (!saveRes.ok) throw new Error('Could not save recropped collection images.');
+      }
+      const res = await fetch('/api/publish', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(isDraft
+          ? { cardId, draft: true }
+          : { cardId, postText, promotedOnly }
+        ),
+      });
 
-    if (!res.ok) {
+      if (!res.ok) {
+        const text = await res.text();
+        let data = {};
+        try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text }; }
+        throw new Error(data.error || (isDraft ? 'Card creation failed' : 'Publish failed'));
+      }
+
       const data = await res.json();
-      throw new Error(data.error || (isDraft ? 'Card creation failed' : 'Publish failed'));
+      setPublishResult({ tweetId: data.tweetId, cardUri: data.cardUri });
+    } finally {
+      skipAutosaveRef.current = false;
     }
-
-    const data = await res.json();
-    setPublishResult({ tweetId: data.tweetId, cardUri: data.cardUri });
   };
 
   const updatePrompt = (index, field, value) => {
@@ -268,6 +451,43 @@ export default function CardBuilder() {
     }
   };
 
+  const updatePollChoice = (index, value) => {
+    setPollChoices((prev) => {
+      const next = [...prev];
+      next[index] = value.slice(0, POLL_CHOICE_MAX);
+      return next;
+    });
+  };
+
+  const addPollChoice = () => {
+    if (pollChoices.length < 4) {
+      setPollChoices((prev) => [...prev, '']);
+    }
+  };
+
+  const removePollChoice = (index) => {
+    if (index >= 2 && pollChoices.length > 2) {
+      setPollChoices((prev) => prev.filter((_, i) => i !== index));
+    }
+  };
+
+  const updateCollectionItem = (index, mediaIdValue, type, key, previewUrl) => {
+    setCollectionItems((prev) => {
+      const next = [...prev];
+      if (!mediaIdValue) {
+        next[index] = { ...EMPTY_COLLECTION_ITEM };
+        return next;
+      }
+      next[index] = {
+        mediaId: mediaIdValue,
+        mediaKey: key || next[index].mediaKey,
+        mediaType: type || next[index].mediaType,
+        previewUrl: previewUrl || next[index].previewUrl,
+      };
+      return next;
+    });
+  };
+
   if (id && cardLoading) {
     return (
       <div className="min-h-screen">
@@ -288,30 +508,36 @@ export default function CardBuilder() {
       <NavBar />
 
       <main className="max-w-2xl mx-auto px-4 py-8 pb-24">
-        <StepIndicator current={step} />
+        <StepIndicator current={step} steps={isPoll ? POLL_STEPS : isCollection ? COLLECTION_STEPS : CONVO_STEPS} />
 
-        {saving && (
-          <div className="text-xs text-x-secondary mb-4 flex items-center gap-1.5">
-            <div className="w-1.5 h-1.5 rounded-full bg-x-blue animate-pulse" />
-            Saving...
-          </div>
-        )}
+        <div className={`text-xs text-x-secondary mb-4 flex items-center gap-1.5 ${saving ? 'visible' : 'invisible'}`}>
+          <div className="w-1.5 h-1.5 rounded-full bg-x-blue animate-pulse" />
+          Saving...
+        </div>
 
         {/* Step 1: Card Setup */}
         {step === 0 && (
           <div className="space-y-6 fade-in">
-            <h2 className="text-xl font-semibold text-x-text">Card Setup</h2>
+            <h2 className="text-xl font-semibold text-x-text">
+              {isPoll ? 'Media Poll' : isCollection ? 'Collection Ad' : 'Card Setup'}
+            </h2>
+
+            {isPoll && mediaPollsEnabled === false && (
+              <p className="text-sm text-x-red bg-x-red/10 border border-x-red/20 rounded-lg px-4 py-3">
+                This Ads account does not have Media Forward Polls enabled. Ask your X account manager to grant PROMOTED_MEDIA_POLLS before publishing.
+              </p>
+            )}
 
             <div className="space-y-2">
               <label className="text-sm text-x-secondary" htmlFor="card-name">
-                Card Name
+                {isPoll ? 'Poll Name' : isCollection ? 'Collection Name' : 'Card Name'}
               </label>
               <input
                 id="card-name"
                 type="text"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="My Conversation Card"
+                placeholder={isPoll ? 'My Media Poll' : isCollection ? 'My Collection Ad' : 'My Conversation Card'}
                 className="w-full bg-x-black border border-x-border rounded-lg px-4 py-3 text-sm text-x-text placeholder:text-x-secondary/50 focus:border-x-blue focus:outline-none transition-colors"
               />
               <p className="text-xs text-x-secondary">
@@ -320,8 +546,10 @@ export default function CardBuilder() {
             </div>
 
             <MediaUploader
-              label="Card Media"
+              label={isCollection ? 'Hero Media' : 'Card Media'}
               value={mediaId}
+              previewUrl={mediaPreviewUrl}
+              mediaType={mediaType}
               onChange={(id, type, key, previewUrl) => {
                 setMediaId(id);
                 if (type) setMediaType(type);
@@ -329,10 +557,55 @@ export default function CardBuilder() {
                 if (previewUrl) setMediaPreviewUrl(previewUrl);
                 if (!id) { setMediaType(null); setMediaKey(null); setMediaPreviewUrl(null); }
               }}
-              hintText="PNG, JPG, MP4, MOV — images must be 1.91:1 ratio (e.g. 1200×628)"
+              hintText={isCollection
+                ? 'PNG, JPG, MP4, MOV — hero image, cropped to 1.91:1. This is the large image on top.'
+                : isPoll
+                ? 'PNG, JPG, MP4, MOV — images are cropped to 1.91:1, videos 16:9'
+                : 'PNG, JPG, MP4, MOV — images are cropped to 1.91:1'}
               requiredAspectRatio="191:100"
             />
 
+            {isCollection && (
+              <>
+                <div className="space-y-2">
+                  <label className="text-sm text-x-secondary" htmlFor="collection-title">
+                    Title
+                  </label>
+                  <div className="relative">
+                    <input
+                      id="collection-title"
+                      type="text"
+                      value={headline}
+                      onChange={(e) => setHeadline(e.target.value.slice(0, 70))}
+                      maxLength={70}
+                      placeholder="Shop the collection"
+                      className="w-full bg-x-black border border-x-border rounded-lg px-4 py-3 text-sm text-x-text placeholder:text-x-secondary/50 focus:border-x-blue focus:outline-none transition-colors"
+                    />
+                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-x-secondary">
+                      {headline.length}/70
+                    </span>
+                  </div>
+                  <p className="text-xs text-x-secondary">Shown on the card under the media</p>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-x-secondary" htmlFor="destination-url">
+                    Destination URL
+                  </label>
+                  <input
+                    id="destination-url"
+                    type="url"
+                    value={destinationUrl}
+                    onChange={(e) => setDestinationUrl(e.target.value)}
+                    placeholder="https://example.com/shop"
+                    className="w-full bg-x-black border border-x-border rounded-lg px-4 py-3 text-sm text-x-text placeholder:text-x-secondary/50 focus:border-x-blue focus:outline-none transition-colors"
+                  />
+                  <p className="text-xs text-x-secondary">Must be https. Used for every collection item.</p>
+                </div>
+              </>
+            )}
+
+            {isConversation && (
+              <>
             {/* Cover media toggle */}
             <label className="flex items-center gap-3 cursor-pointer">
               <div
@@ -364,6 +637,8 @@ export default function CardBuilder() {
                 <MediaUploader
                   label="Cover Media"
                   value={coverMediaId}
+                  previewUrl={coverPreviewUrl}
+                  mediaType={coverMediaType}
                   onChange={(id, type, key, previewUrl) => {
                     setCoverMediaId(id);
                     if (type) setCoverMediaType(type);
@@ -373,8 +648,8 @@ export default function CardBuilder() {
                   }}
                   requiredAspectRatio={mediaType && mediaType.includes('video') ? '16:9' : '191:100'}
                   hintText={mediaType && mediaType.includes('video')
-                    ? 'PNG, JPG — must be 16:9 ratio (e.g. 1920×1080)'
-                    : 'PNG, JPG — must be 1.91:1 ratio (e.g. 1200×628)'}
+                    ? 'PNG, JPG — cropped to 16:9 (e.g. 1920×1080)'
+                    : 'PNG, JPG — cropped to 1.91:1 (e.g. 1200×628)'}
                   acceptTypes="image"
                   hideLibrary
                 />
@@ -409,6 +684,8 @@ export default function CardBuilder() {
                   : 'Displayed on the card — maps to the card title'}
               </p>
             </div>
+              </>
+            )}
 
             <div className="flex justify-end pt-4">
               <XButton onClick={handleNext}>Next</XButton>
@@ -419,8 +696,120 @@ export default function CardBuilder() {
           </div>
         )}
 
-        {/* Step 2: Engagement Prompts */}
-        {step === 1 && (
+        {/* Step 2: Poll options or engagement prompts */}
+        {step === 1 && isCollection && (
+          <div className="space-y-6 fade-in">
+            <h2 className="text-xl font-semibold text-x-text">Collection Items</h2>
+            <p className="text-xs text-x-secondary">
+              Smaller images under the hero. X requires every slide to share the same aspect ratio — thumbnails are cropped to match the hero. At least one, up to five, each a different image.
+            </p>
+            <div className="grid grid-cols-2 gap-4">
+              {collectionItems.map((item, i) => (
+                <MediaUploader
+                  key={i}
+                  label={`Thumbnail ${i + 1}`}
+                  value={item.mediaId}
+                  previewUrl={item.previewUrl}
+                  mediaType={item.mediaType}
+                  acceptTypes="image"
+                  requiredAspectRatio={mediaType && mediaType.includes('video') ? '16:9' : '191:100'}
+                  hintText={mediaType && mediaType.includes('video')
+                    ? 'PNG, JPG — cropped to 16:9 to match the video hero'
+                    : 'PNG, JPG — cropped to 1.91:1 to match the hero'}
+                  onChange={(id, type, key, previewUrl) => updateCollectionItem(i, id, type, key, previewUrl)}
+                />
+              ))}
+            </div>
+            <div className="flex justify-between pt-4">
+              <XButton variant="ghost" onClick={() => { setValidationError(null); setStep(0); }}>
+                Back
+              </XButton>
+              <XButton onClick={handleNext}>Next</XButton>
+            </div>
+            {validationError && (
+              <p className="text-sm text-x-red mt-2 text-right">{validationError}</p>
+            )}
+          </div>
+        )}
+
+        {step === 1 && isPoll && (
+          <div className="space-y-6 fade-in">
+            <h2 className="text-xl font-semibold text-x-text">Poll Options</h2>
+            <p className="text-xs text-x-secondary">
+              2–4 choices, 25 characters each. The poll timer starts when the card is created on X, not when the post goes live — keep this as a local draft until you are ready to publish.
+            </p>
+
+            <div className="space-y-3">
+              {pollChoices.map((choice, i) => (
+                <div key={i} className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-sm text-x-secondary" htmlFor={`poll-choice-${i}`}>
+                      Choice {i + 1} {i < 2 && <span className="text-x-red">*</span>}
+                    </label>
+                    {i >= 2 && (
+                      <button
+                        type="button"
+                        onClick={() => removePollChoice(i)}
+                        className="text-xs text-x-red hover:underline"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                  <div className="relative">
+                    <input
+                      id={`poll-choice-${i}`}
+                      type="text"
+                      value={choice}
+                      onChange={(e) => updatePollChoice(i, e.target.value)}
+                      maxLength={POLL_CHOICE_MAX}
+                      placeholder={i === 0 ? 'East' : i === 1 ? 'West' : 'Optional'}
+                      className="w-full bg-x-black border border-x-border rounded-lg px-4 py-3 text-sm text-x-text placeholder:text-x-secondary/50 focus:border-x-blue focus:outline-none transition-colors"
+                    />
+                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-x-secondary">
+                      {choice.length}/{POLL_CHOICE_MAX}
+                    </span>
+                  </div>
+                </div>
+              ))}
+              {pollChoices.length < 4 && (
+                <button type="button" onClick={addPollChoice} className="text-sm text-x-blue hover:underline">
+                  + Add another choice
+                </button>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-sm text-x-secondary" htmlFor="poll-duration">
+                Duration
+              </label>
+              <select
+                id="poll-duration"
+                value={pollDurationMinutes}
+                onChange={(e) => setPollDurationMinutes(Number(e.target.value))}
+                className="w-full bg-x-black border border-x-border rounded-lg px-4 py-3 text-sm text-x-text focus:border-x-blue focus:outline-none"
+              >
+                {POLL_DURATIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex justify-between pt-4">
+              <XButton variant="ghost" onClick={() => { setValidationError(null); setStep(0); }}>
+                Back
+              </XButton>
+              <XButton onClick={handleNext}>Next</XButton>
+            </div>
+            {validationError && (
+              <p className="text-sm text-x-red mt-2 text-right">{validationError}</p>
+            )}
+          </div>
+        )}
+
+        {step === 1 && isConversation && (
           <div className="space-y-6 fade-in">
             <h2 className="text-xl font-semibold text-x-text">
               Engagement Prompts
@@ -566,6 +955,11 @@ export default function CardBuilder() {
         {step === 2 && (
           <div className="space-y-6 fade-in">
             <h2 className="text-xl font-semibold text-x-text">Publish</h2>
+            {isPoll && (
+              <p className="text-xs text-x-secondary">
+                Publishing creates the poll on X immediately and starts the timer. Save as draft to keep it local only.
+              </p>
+            )}
 
             <div className="space-y-2">
               <label className="text-sm text-x-secondary" htmlFor="post-text">
@@ -654,7 +1048,9 @@ export default function CardBuilder() {
                     onChange={(e) => setPublishOption(e.target.value)}
                     className="w-4 h-4 accent-x-blue"
                   />
-                  <span className="text-sm text-x-text">Save as draft</span>
+                  <span className="text-sm text-x-text">
+                    {isPoll ? 'Save as local draft' : 'Save as draft'}
+                  </span>
                 </label>
               </div>
             </div>
@@ -706,6 +1102,8 @@ export default function CardBuilder() {
           }}
           user={user}
           isDraft={publishOption === 'draft'}
+          isPoll={isPoll}
+          isCollection={isCollection}
           onConfirm={handleConfirmPublish}
           onCancel={() => setShowPublishModal(false)}
           publishResult={publishResult}

@@ -67,8 +67,27 @@ export function useCards() {
   const duplicateCard = async (id) => {
     const original = cards.find((c) => c.id === id);
     if (!original) return;
-    const { id: _, x_card_uri, tweet_id, status, created_at, updated_at, ...rest } = original;
-    return createCard({ ...rest, name: `${rest.name || 'Card'} (copy)`, status: 'draft' });
+    return createCard({
+      name: `${original.name || 'Card'} (copy)`,
+      headline: original.headline,
+      mediaId: original.media_id || original.mediaId,
+      mediaKey: original.media_key || original.mediaKey,
+      mediaType: original.media_type || original.mediaType,
+      coverMediaId: original.cover_media_id || original.coverMediaId,
+      coverMediaKey: original.cover_media_key || original.coverMediaKey,
+      coverMediaType: original.cover_media_type || original.coverMediaType,
+      mediaPreviewUrl: original.media_preview_url || original.mediaPreviewUrl,
+      prompts: original.prompts,
+      thankYouText: original.thank_you_text || original.thankYouText,
+      thankYouUrl: original.thank_you_url || original.thankYouUrl,
+      postText: original.post_text || original.postText,
+      promotedOnly: original.promotedOnly ?? !!original.promoted_only,
+      cardType: original.card_type || original.cardType || 'conversation',
+      pollChoices: original.pollChoices || original.poll_choices || [],
+      pollDurationMinutes: original.pollDurationMinutes ?? original.poll_duration_minutes ?? 1440,
+      collectionItems: original.collectionItems || original.collection_items || [],
+      destinationUrl: original.destinationUrl || original.destination_url || null,
+    });
   };
 
   return { cards, loading, error, fetchCards, createCard, updateCard, deleteCard, duplicateCard };

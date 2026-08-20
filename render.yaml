@@ -9,11 +9,17 @@ services:
         value: production
       - key: SESSION_SECRET
         generateValue: true
+      - key: TOKEN_ENCRYPTION_KEY
+        generateValue: true
       - key: DATABASE_PATH
         value: /var/data/cardforge.db
       - key: X_CLIENT_ID
         sync: false
       - key: X_CLIENT_SECRET
+        sync: false
+      - key: X_API_KEY
+        sync: false
+      - key: X_API_KEY_SECRET
         sync: false
       - key: X_REDIRECT_URI
         sync: false

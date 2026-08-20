@@ -13,7 +13,7 @@ function percentEncode(str) {
   return encodeURIComponent(str).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
 }
 
-function generateOAuth1Header(method, url, params = {}, accessToken, tokenSecret) {
+function generateOAuth1Header(method, url, params = {}, accessToken, tokenSecret, oauthExtras = {}) {
   const consumerKey = process.env.X_API_KEY;
   const consumerSecret = process.env.X_API_KEY_SECRET;
 
@@ -26,6 +26,7 @@ function generateOAuth1Header(method, url, params = {}, accessToken, tokenSecret
     oauth_timestamp: Math.floor(Date.now() / 1000).toString(),
     oauth_token: accessToken,
     oauth_version: '1.0',
+    ...oauthExtras,
   };
 
   const allParams = { ...oauthParams, ...params };
@@ -46,11 +47,45 @@ function generateOAuth1Header(method, url, params = {}, accessToken, tokenSecret
   return header;
 }
 
-// Pick the right OAuth 1.0a token source based on whether user tokens are provided
-function getOAuth1Header(method, url, params = {}, userTokens = null) {
-  const accessToken = userTokens ? userTokens.accessToken : process.env.X_ACCESS_TOKEN;
-  const tokenSecret = userTokens ? userTokens.accessTokenSecret : process.env.X_ACCESS_TOKEN_SECRET;
-  return generateOAuth1Header(method, url, params, accessToken, tokenSecret);
+function getOAuth1Header(method, url, params = {}, userTokens) {
+  if (!userTokens?.accessToken || !userTokens?.accessTokenSecret) return null;
+  return generateOAuth1Header(method, url, params, userTokens.accessToken, userTokens.accessTokenSecret);
+}
+
+function getOAuth1JsonHeader(method, url, rawBody, userTokens) {
+  if (!userTokens?.accessToken || !userTokens?.accessTokenSecret) return null;
+  const oauth_body_hash = crypto.createHash('sha1').update(rawBody).digest('base64');
+  return generateOAuth1Header(
+    method,
+    url,
+    {},
+    userTokens.accessToken,
+    userTokens.accessTokenSecret,
+    { oauth_body_hash }
+  );
+}
+
+function parseAdsResponse(status, text, fallback) {
+  let parsed = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      parsed = null;
+    }
+  }
+  if (status >= 200 && status < 300) {
+    if (parsed) return parsed;
+    const err = new Error(`${fallback}: empty response from X (${status})`);
+    err.status = 502;
+    err.publicMessage = 'X returned an empty response while creating the card.';
+    throw err;
+  }
+  const adsMessage = parsed?.errors?.[0]?.message || parsed?.error || (text && text.slice(0, 300)) || fallback;
+  const err = new Error(`${fallback} (${status}): ${adsMessage}`);
+  err.status = status >= 400 && status < 500 ? status : 502;
+  err.publicMessage = String(adsMessage);
+  throw err;
 }
 
 // --- OAuth 1.0a 3-legged flow (for users to connect their own Ads accounts) ---
@@ -234,6 +269,28 @@ export async function refreshAccessToken(refreshToken) {
   return res.json();
 }
 
+export async function revokeOAuth2Token(token) {
+  if (!token) return;
+
+  const clientId = process.env.X_CLIENT_ID;
+  const clientSecret = process.env.X_CLIENT_SECRET;
+  const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+
+  const res = await fetch('https://api.x.com/2/oauth2/revoke', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: `Basic ${auth}`,
+    },
+    body: new URLSearchParams({ token }),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Token revoke failed: ${err}`);
+  }
+}
+
 export async function getMe(accessToken) {
   const res = await fetch(`${X_API_BASE}/users/me?user.fields=profile_image_url,name,username`, {
     headers: { Authorization: `Bearer ${accessToken}` },
@@ -247,36 +304,30 @@ export async function getMe(accessToken) {
   return data;
 }
 
-export async function getAdAccounts(userTokens = null) {
-  try {
-    const url = `${X_ADS_BASE}/accounts`;
-    const authHeader = getOAuth1Header('GET', url, {}, userTokens);
+export async function listAdAccounts(userTokens) {
+  const url = `${X_ADS_BASE}/accounts`;
+  const authHeader = getOAuth1Header('GET', url, {}, userTokens);
 
-    if (!authHeader) {
-      console.log('[Ads] OAuth 1.0a credentials not configured, skipping ads account fetch');
-      return null;
-    }
-
-    const res = await fetch(url, {
-      headers: { Authorization: authHeader },
-    });
-
-    console.log('[Ads] Fetching ad accounts, status:', res.status);
-
-    if (!res.ok) {
-      const err = await res.text();
-      console.error('[Ads] Failed to fetch ad accounts:', res.status, err);
-      return null;
-    }
-
-    const body = await res.json();
-    const accounts = body.data || [];
-    console.log('[Ads] Ad accounts:', JSON.stringify(accounts.map(a => ({ id: a.id, name: a.name }))));
-    return accounts[0]?.id || null;
-  } catch (err) {
-    console.error('[Ads] Error fetching ad accounts:', err.message);
-    return null;
+  if (!authHeader) {
+    throw new Error('Ads account not connected');
   }
+
+  const res = await fetch(url, {
+    headers: { Authorization: authHeader },
+  });
+
+  console.log('[Ads] Fetching ad accounts, status:', res.status);
+
+  if (!res.ok) {
+    const err = await res.text();
+    console.error('[Ads] Failed to fetch ad accounts:', res.status, err);
+    throw new Error('Failed to fetch ad accounts');
+  }
+
+  const body = await res.json();
+  const accounts = (body.data || []).map((a) => ({ id: a.id, name: a.name }));
+  console.log('[Ads] Ad accounts:', JSON.stringify(accounts));
+  return accounts;
 }
 
 // --- Media Upload via v1.1 + OAuth 1.0a (required for Ads API media) ---
@@ -461,7 +512,7 @@ export async function getMediaLibrary(adAccountId, { cursor, count = 50, q, medi
 
   const authHeader = getOAuth1Header('GET', url, params, userTokens);
   if (!authHeader) {
-    throw new Error('OAuth 1.0a credentials not configured for Ads API');
+    throw new Error('Ads account not connected');
   }
 
   const qs = new URLSearchParams(params).toString();
@@ -503,11 +554,10 @@ export async function getAccountFeatures(adAccountId, userTokens = null) {
   }
 }
 
-export async function createConversationCard(adAccountId, cardData, isVideo = false, userTokens = null) {
-  const cardType = isVideo ? 'video_conversation' : 'image_conversation';
-  const url = `${X_ADS_BASE}/accounts/${adAccountId}/cards/${cardType}`;
+async function postAdsCard(adAccountId, cardPath, cardData, userTokens, logLabel) {
+  const url = `${X_ADS_BASE}/accounts/${adAccountId}/cards/${cardPath}`;
 
-  // Conversation card endpoints use form-encoded params included in OAuth signature
+  // Card endpoints use form-encoded params included in OAuth signature
   const params = {};
   for (const [k, v] of Object.entries(cardData)) {
     if (v != null && v !== '') params[k] = String(v);
@@ -516,10 +566,10 @@ export async function createConversationCard(adAccountId, cardData, isVideo = fa
   const authHeader = getOAuth1Header('POST', url, params, userTokens);
 
   if (!authHeader) {
-    throw new Error('OAuth 1.0a credentials not configured for Ads API');
+    throw new Error('Ads account not connected');
   }
 
-  console.log('[Ads] Creating conversation card:', { cardType, params });
+  console.log(`[Ads] Creating ${logLabel}:`, { cardPath, params });
 
   const body = new URLSearchParams(params);
 
@@ -553,13 +603,72 @@ export async function createConversationCard(adAccountId, cardData, isVideo = fa
   }
 }
 
+export async function createConversationCard(adAccountId, cardData, isVideo = false, userTokens = null) {
+  const cardType = isVideo ? 'video_conversation' : 'image_conversation';
+  return postAdsCard(adAccountId, cardType, cardData, userTokens, 'conversation card');
+}
+
+export async function createPollCard(adAccountId, cardData, userTokens = null) {
+  return postAdsCard(adAccountId, 'poll', cardData, userTokens, 'poll card');
+}
+
+export async function createJsonCard(adAccountId, payload, userTokens = null) {
+  const url = `${X_ADS_BASE}/accounts/${adAccountId}/cards`;
+  const rawBody = JSON.stringify(payload);
+
+  console.log('[Ads] Creating JSON card:', payload);
+
+  const MAX_RETRIES = 3;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const header = getOAuth1JsonHeader('POST', url, rawBody, userTokens);
+    if (!header) {
+      throw new Error('Ads account not connected');
+    }
+
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          Authorization: header,
+          'Content-Type': 'application/json',
+        },
+        body: rawBody,
+      });
+    } catch (e) {
+      const err = new Error(`Card creation failed: ${e.message}`);
+      err.status = 502;
+      err.publicMessage = 'Could not reach the X Ads API. Try again in a moment.';
+      throw err;
+    }
+
+    const text = await res.text();
+    if (res.status === 503 && attempt < MAX_RETRIES) {
+      const delay = 1000 * attempt;
+      console.warn(`[Ads] JSON card creation 503, retrying in ${delay}ms (attempt ${attempt}/${MAX_RETRIES})`);
+      await new Promise((r) => setTimeout(r, delay));
+      continue;
+    }
+
+    if (!res.ok) {
+      console.error('[Ads] JSON card creation failed:', res.status, text);
+    }
+    return parseAdsResponse(res.status, text, 'Card creation failed');
+  }
+
+  const err = new Error('Card creation failed: X Ads API unavailable');
+  err.status = 502;
+  err.publicMessage = 'X Ads API was unavailable. Try again in a moment.';
+  throw err;
+}
+
 export async function getConversationCard(adAccountId, cardId, isVideo = false, userTokens = null) {
   const cardType = isVideo ? 'video_conversation' : 'image_conversation';
   const url = `${X_ADS_BASE}/accounts/${adAccountId}/cards/${cardType}/${cardId}`;
 
   const authHeader = getOAuth1Header('GET', url, {}, userTokens);
   if (!authHeader) {
-    throw new Error('OAuth 1.0a credentials not configured for Ads API');
+    throw new Error('Ads account not connected');
   }
 
   const res = await fetch(url, {
@@ -582,7 +691,7 @@ export async function listConversationCards(adAccountId, cardType = 'image_conve
 
   const authHeader = getOAuth1Header('GET', url, params, userTokens);
   if (!authHeader) {
-    throw new Error('OAuth 1.0a credentials not configured for Ads API');
+    throw new Error('Ads account not connected');
   }
 
   const qs = new URLSearchParams(params).toString();
@@ -608,7 +717,7 @@ export async function createAdsTweet(adAccountId, { text, cardUri, asUserId, nul
 
   const authHeader = getOAuth1Header('POST', url, params, userTokens);
   if (!authHeader) {
-    throw new Error('OAuth 1.0a credentials not configured for Ads API');
+    throw new Error('Ads account not connected');
   }
 
   console.log('[Ads] Creating tweet:', { adAccountId, params });

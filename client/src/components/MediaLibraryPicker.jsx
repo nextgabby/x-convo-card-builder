@@ -1,18 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-
-function isCompatibleRatio(aspectRatio, requiredRatio) {
-  if (!requiredRatio || !aspectRatio) return true;
-  // Parse "W:H" strings like "191:100", "16:9", "1.91:1"
-  const parse = (str) => {
-    const parts = str.split(':').map(Number);
-    if (parts.length !== 2 || parts[1] === 0) return null;
-    return parts[0] / parts[1];
-  };
-  const actual = parse(aspectRatio);
-  const required = parse(requiredRatio);
-  if (!actual || !required) return true;
-  return Math.abs(actual - required) < 0.05; // ~2.5% tolerance
-}
+import { isCompatibleRatio, ratioLabel } from '../lib/cropImage';
 
 export default function MediaLibraryPicker({ open, onSelect, onClose, acceptTypes = 'both', requiredAspectRatio }) {
   const [items, setItems] = useState([]);
@@ -49,6 +36,15 @@ export default function MediaLibraryPicker({ open, onSelect, onClose, acceptType
   }, [mediaTypeFilter]);
 
   useEffect(() => {
+    if (!open) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [open]);
+
+  useEffect(() => {
     if (open) {
       setItems([]);
       setSelected(null);
@@ -72,7 +68,7 @@ export default function MediaLibraryPicker({ open, onSelect, onClose, acceptType
             <h2 className="text-lg font-semibold text-x-text">Media Library</h2>
             {requiredAspectRatio && (
               <p className="text-[11px] text-x-secondary mt-0.5">
-                Card images require 1.91:1 aspect ratio (e.g. 1200x628)
+                Images are cropped to {ratioLabel(requiredAspectRatio)}
               </p>
             )}
           </div>
@@ -104,7 +100,12 @@ export default function MediaLibraryPicker({ open, onSelect, onClose, acceptType
               const isSelected = selected?.mediaKey === item.mediaKey;
               const thumbUrl = item.posterUrl || item.mediaUrl;
               const isVideo = item.mediaType === 'VIDEO';
-              const compatible = isVideo || isCompatibleRatio(item.aspectRatio, requiredAspectRatio);
+              const compatible = isVideo
+                ? isCompatibleRatio(item.aspectRatio, requiredAspectRatio)
+                : true;
+              const willCrop = !isVideo && requiredAspectRatio && (
+                !item.aspectRatio || !isCompatibleRatio(item.aspectRatio, requiredAspectRatio)
+              );
 
               return (
                 <button
@@ -143,10 +144,15 @@ export default function MediaLibraryPicker({ open, onSelect, onClose, acceptType
                     </div>
                   )}
 
-                  {/* Aspect ratio badge */}
-                  {item.aspectRatio && requiredAspectRatio && !compatible && (
+                  {/* Crop / mismatch badge */}
+                  {willCrop && (
+                    <div className="absolute top-1.5 left-1.5 bg-black/70 text-white text-[9px] px-1.5 py-0.5 rounded">
+                      Crop to {ratioLabel(requiredAspectRatio)}
+                    </div>
+                  )}
+                  {isVideo && requiredAspectRatio && !compatible && (
                     <div className="absolute top-1.5 left-1.5 bg-x-red/80 text-white text-[9px] px-1.5 py-0.5 rounded">
-                      {item.aspectRatio}
+                      {item.aspectRatio || 'ratio'}
                     </div>
                   )}
 
@@ -190,9 +196,13 @@ export default function MediaLibraryPicker({ open, onSelect, onClose, acceptType
 
         {/* Footer */}
         <div className="flex items-center justify-between px-5 py-4 border-t border-x-border shrink-0">
-          {selected && selected.mediaType !== 'VIDEO' && requiredAspectRatio && !isCompatibleRatio(selected.aspectRatio, requiredAspectRatio) ? (
+          {selected?.mediaType === 'VIDEO' && requiredAspectRatio && !isCompatibleRatio(selected.aspectRatio, requiredAspectRatio) ? (
             <p className="text-xs text-x-red">
-              Wrong aspect ratio ({selected.aspectRatio || 'unknown'}) — card images need 1.91:1
+              This video is {selected.aspectRatio || 'the wrong ratio'} — videos cannot be cropped to {ratioLabel(requiredAspectRatio)}
+            </p>
+          ) : selected && selected.mediaType !== 'VIDEO' && requiredAspectRatio && (!selected.aspectRatio || !isCompatibleRatio(selected.aspectRatio, requiredAspectRatio)) ? (
+            <p className="text-xs text-x-secondary">
+              Will be cropped to {ratioLabel(requiredAspectRatio)}
             </p>
           ) : (
             <div />
@@ -206,7 +216,7 @@ export default function MediaLibraryPicker({ open, onSelect, onClose, acceptType
             </button>
             <button
               onClick={() => selected && onSelect(selected)}
-              disabled={!selected}
+              disabled={!selected || (selected.mediaType === 'VIDEO' && requiredAspectRatio && !isCompatibleRatio(selected.aspectRatio, requiredAspectRatio))}
               className="px-4 py-2 text-sm font-semibold rounded-full transition-colors bg-x-blue text-white hover:bg-x-blue/90 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Use Selected

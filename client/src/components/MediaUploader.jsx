@@ -1,13 +1,77 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import MediaLibraryPicker from './MediaLibraryPicker';
+import { cropImageFile, isCompatibleRatio, ratioLabel } from '../lib/cropImage';
 
-export default function MediaUploader({ value, onChange, label = 'Upload Media', acceptTypes = 'both', hintText, requiredAspectRatio, hideLibrary = false }) {
+function persistableMediaUrl(url) {
+  if (!url) return null;
+  if (url.startsWith('/api/media/')) return url;
+  try {
+    const parsed = new URL(url, window.location.origin);
+    if (['video.twimg.com', 'pbs.twimg.com', 'ton.twimg.com'].includes(parsed.hostname)) {
+      return `/api/media/proxy?url=${encodeURIComponent(parsed.href)}`;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function captureVideoThumbnail(file) {
+  return new Promise((resolve, reject) => {
+    const src = URL.createObjectURL(file);
+    const video = document.createElement('video');
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = 'metadata';
+    video.src = src;
+
+    const cleanup = () => URL.revokeObjectURL(src);
+    const fail = () => {
+      cleanup();
+      reject(new Error('Could not capture video thumbnail'));
+    };
+
+    video.onerror = fail;
+    video.onloadeddata = () => {
+      const grab = () => {
+        const canvas = document.createElement('canvas');
+        const w = video.videoWidth || 1280;
+        const h = video.videoHeight || 720;
+        const scale = Math.min(1, 1200 / w);
+        canvas.width = Math.round(w * scale);
+        canvas.height = Math.round(h * scale);
+        canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob((blob) => {
+          cleanup();
+          if (blob) resolve(blob);
+          else fail();
+        }, 'image/jpeg', 0.82);
+      };
+      video.currentTime = 0.1;
+      video.onseeked = grab;
+    };
+  });
+}
+
+export default function MediaUploader({
+  value,
+  onChange,
+  label = 'Upload Media',
+  acceptTypes = 'both',
+  hintText,
+  requiredAspectRatio,
+  hideLibrary = false,
+  previewUrl,
+  mediaType: savedMediaType,
+  aspect = 'video',
+}) {
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [progress, setProgress] = useState(0);
   const [preview, setPreview] = useState(null);
   const [error, setError] = useState(null);
   const [showLibrary, setShowLibrary] = useState(false);
+  const [imgFailed, setImgFailed] = useState(false);
   const inputRef = useRef(null);
 
   const ACCEPT_MAP = {
@@ -16,6 +80,24 @@ export default function MediaUploader({ value, onChange, label = 'Upload Media',
     both: '.png,.jpg,.jpeg,.mp4,.mov',
   };
   const ACCEPTED = ACCEPT_MAP[acceptTypes] || ACCEPT_MAP.both;
+  const aspectClass = aspect === 'square' ? 'aspect-square' : 'aspect-video';
+
+  useEffect(() => {
+    setImgFailed(false);
+    if (!value || !previewUrl) {
+      if (!value) setPreview(null);
+      return;
+    }
+    setPreview((prev) => {
+      if (prev?.url?.startsWith('blob:')) return prev;
+      const isVideo = savedMediaType && savedMediaType.includes('video');
+      return {
+        url: previewUrl,
+        posterUrl: isVideo ? previewUrl : undefined,
+        type: isVideo ? 'video' : 'image',
+      };
+    });
+  }, [value, previewUrl, savedMediaType]);
 
   const handleFile = useCallback(
     async (file) => {
@@ -43,26 +125,22 @@ export default function MediaUploader({ value, onChange, label = 'Upload Media',
       setUploading(true);
       setProgress(0);
 
-      // Validate image dimensions and aspect ratio
-      if (isImage) {
+      let uploadFile = file;
+      if (isImage && requiredAspectRatio) {
+        try {
+          uploadFile = await cropImageFile(file, requiredAspectRatio);
+        } catch (err) {
+          setError(err.message);
+          setUploading(false);
+          return;
+        }
+      } else if (isImage) {
         const check = await new Promise((resolve) => {
           const img = new Image();
           img.onload = () => {
-            // Minimum dimensions required by X Ads API
             if (img.width < 800 || img.height < 314) {
-              resolve({ error: `Image too small (${img.width}×${img.height}). Minimum 800×314 pixels required.` });
+              resolve({ error: `Image too small (${img.width}×${img.height}). Minimum 800px on the long edge.` });
               return;
-            }
-            // Check aspect ratio if required
-            if (requiredAspectRatio) {
-              const [rw, rh] = requiredAspectRatio.split(':').map(Number);
-              const required = rw / rh;
-              const actual = img.width / img.height;
-              if (Math.abs(actual - required) >= 0.05) {
-                const label = required > 1.9 ? '1.91:1 (e.g. 1200×628)' : '16:9 (e.g. 1920×1080)';
-                resolve({ error: `Image must be ${label} aspect ratio. Current: ${img.width}×${img.height}` });
-                return;
-              }
             }
             resolve({ ok: true });
           };
@@ -76,12 +154,20 @@ export default function MediaUploader({ value, onChange, label = 'Upload Media',
         }
       }
 
-      const url = URL.createObjectURL(file);
+      const url = URL.createObjectURL(uploadFile);
       setPreview({ url, type: isVideo ? 'video' : 'image' });
 
       try {
         const formData = new FormData();
-        formData.append('file', file);
+        formData.append('file', uploadFile);
+        if (isVideo) {
+          try {
+            const thumb = await captureVideoThumbnail(file);
+            formData.append('thumbnail', thumb, 'thumb.jpg');
+          } catch {
+            // Preview can still be shown from the local blob for this session
+          }
+        }
 
         const progressInterval = setInterval(() => {
           setProgress((p) => Math.min(p + 10, 90));
@@ -100,9 +186,16 @@ export default function MediaUploader({ value, onChange, label = 'Upload Media',
           throw new Error(data.error || 'Upload failed');
         }
 
-        const { mediaId, mediaType, mediaKey } = await res.json();
+        const { mediaId, mediaType, mediaKey, previewUrl: savedPreview } = await res.json();
         setProgress(100);
-        onChange?.(mediaId, mediaType, mediaKey, url);
+        if (savedPreview) {
+          setPreview((prev) => (
+            isVideo
+              ? { ...prev, posterUrl: savedPreview }
+              : { url: savedPreview, type: 'image' }
+          ));
+        }
+        onChange?.(mediaId, mediaType, mediaKey, savedPreview || null);
       } catch (err) {
         setError(err.message);
         setPreview(null);
@@ -110,7 +203,7 @@ export default function MediaUploader({ value, onChange, label = 'Upload Media',
         setUploading(false);
       }
     },
-    [onChange]
+    [onChange, acceptTypes, requiredAspectRatio]
   );
 
   const handleDrop = useCallback(
@@ -131,23 +224,49 @@ export default function MediaUploader({ value, onChange, label = 'Upload Media',
     if (inputRef.current) inputRef.current.value = '';
   };
 
-  const handleLibrarySelect = (item) => {
+  const handleLibrarySelect = async (item) => {
+    const isVideo = item.mediaType === 'VIDEO';
+    const needsCrop = !isVideo && requiredAspectRatio && (
+      !item.aspectRatio || !isCompatibleRatio(item.aspectRatio, requiredAspectRatio)
+    );
+
+    if (needsCrop) {
+      const source = persistableMediaUrl(item.mediaUrl) || persistableMediaUrl(item.posterUrl);
+      if (!source) {
+        setError(`Could not load this image to crop it to ${ratioLabel(requiredAspectRatio)}. Upload the file instead.`);
+        setShowLibrary(false);
+        return;
+      }
+      setShowLibrary(false);
+      setError(null);
+      setUploading(true);
+      setProgress(0);
+      try {
+        const res = await fetch(source, { credentials: 'include' });
+        if (!res.ok) throw new Error('Could not load library image');
+        const blob = await res.blob();
+        const type = blob.type && blob.type.startsWith('image/') ? blob.type : 'image/jpeg';
+        const file = new File([blob], item.fileName || 'library.jpg', { type });
+        await handleFile(file);
+      } catch (err) {
+        setError(err.message || 'Could not crop library image');
+        setUploading(false);
+      }
+      return;
+    }
+
     const mediaCategory = item.mediaCategory
       ? item.mediaCategory.toLowerCase()
       : item.mediaType === 'VIDEO' ? 'tweet_video' : 'tweet_image';
 
-    const isVideo = item.mediaType === 'VIDEO';
-    // For videos, use the poster as thumbnail and proxy the actual video URL for playback.
-    // video.twimg.com URLs require auth and 403 in the browser directly.
-    const posterUrl = item.posterUrl || null;
+    const posterUrl = persistableMediaUrl(item.posterUrl) || persistableMediaUrl(item.mediaUrl);
     const videoSrc = isVideo && item.mediaUrl
-      ? `/api/media/proxy?url=${encodeURIComponent(item.mediaUrl)}`
+      ? persistableMediaUrl(item.mediaUrl)
       : null;
-    const previewUrl = posterUrl || item.mediaUrl;
 
-    if (previewUrl || videoSrc) {
+    if (posterUrl || videoSrc) {
       setPreview({
-        url: videoSrc || previewUrl,
+        url: videoSrc || posterUrl,
         posterUrl: posterUrl,
         type: isVideo ? 'video' : 'image',
       });
@@ -155,11 +274,13 @@ export default function MediaUploader({ value, onChange, label = 'Upload Media',
 
     setError(null);
     setShowLibrary(false);
-    onChange?.(item.mediaKey, mediaCategory, item.mediaKey, posterUrl || previewUrl);
+    onChange?.(item.mediaKey, mediaCategory, item.mediaKey, posterUrl || videoSrc);
   };
 
-  // Show uploaded state: either we have a local preview or a saved media ID
   const hasMedia = value && (preview || !uploading);
+  const playableVideo = preview?.type === 'video' && (
+    preview.url?.startsWith('blob:') || preview.url?.startsWith('/api/media/proxy')
+  );
 
   return (
     <>
@@ -167,24 +288,35 @@ export default function MediaUploader({ value, onChange, label = 'Upload Media',
         <div className="space-y-2">
           <label className="text-sm text-x-secondary">{label}</label>
           <div className="relative rounded-xl overflow-hidden border border-x-border">
-            {preview ? (
-              preview.type === 'video' ? (
+            {preview && !imgFailed ? (
+              playableVideo ? (
                 <video
                   src={preview.url}
                   poster={preview.posterUrl || undefined}
                   controls
-                  className="w-full aspect-video object-cover bg-black"
+                  className={`w-full ${aspectClass} object-cover bg-black`}
                 />
               ) : (
-                <img
-                  src={preview.url}
-                  alt="Upload preview"
-                  className="w-full aspect-video object-cover bg-black"
-                />
+                <div className="relative">
+                  <img
+                    src={preview.posterUrl || preview.url}
+                    alt="Upload preview"
+                    className={`w-full ${aspectClass} object-cover bg-black`}
+                    onError={() => setImgFailed(true)}
+                  />
+                  {preview.type === 'video' && (
+                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                      <div className="w-10 h-10 bg-black/60 rounded-full flex items-center justify-center">
+                        <svg className="w-5 h-5 text-white ml-0.5" fill="currentColor" viewBox="0 0 24 24">
+                          <path d="M8 5v14l11-7z" />
+                        </svg>
+                      </div>
+                    </div>
+                  )}
+                </div>
               )
             ) : (
-              // No local preview but media ID exists (loaded from saved card)
-              <div className="w-full aspect-video bg-x-surface flex items-center justify-center">
+              <div className={`w-full ${aspectClass} bg-x-surface flex items-center justify-center`}>
                 <div className="text-center space-y-2">
                   <svg className="w-10 h-10 mx-auto text-x-green" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -207,7 +339,7 @@ export default function MediaUploader({ value, onChange, label = 'Upload Media',
         <div className="space-y-2">
           <label className="text-sm text-x-secondary">{label}</label>
           <div
-            className={`border-2 border-dashed rounded-xl p-8 text-center transition-colors cursor-pointer ${
+            className={`border-2 border-dashed rounded-xl ${aspectClass} flex flex-col items-center justify-center px-4 text-center transition-colors cursor-pointer ${
               dragging
                 ? 'border-x-blue bg-x-blue/5'
                 : error

@@ -41,6 +41,21 @@ if (!columns.includes('headline')) {
 if (!columns.includes('media_preview_url')) {
   db.exec("ALTER TABLE cards ADD COLUMN media_preview_url TEXT");
 }
+if (!columns.includes('card_type')) {
+  db.exec("ALTER TABLE cards ADD COLUMN card_type TEXT DEFAULT 'conversation'");
+}
+if (!columns.includes('poll_choices')) {
+  db.exec("ALTER TABLE cards ADD COLUMN poll_choices JSON");
+}
+if (!columns.includes('poll_duration_minutes')) {
+  db.exec("ALTER TABLE cards ADD COLUMN poll_duration_minutes INTEGER");
+}
+if (!columns.includes('collection_items')) {
+  db.exec("ALTER TABLE cards ADD COLUMN collection_items JSON");
+}
+if (!columns.includes('destination_url')) {
+  db.exec("ALTER TABLE cards ADD COLUMN destination_url TEXT");
+}
 
 // Add OAuth 1.0a user token columns
 const userCols = db.prepare("PRAGMA table_info(users)").all().map(c => c.name);

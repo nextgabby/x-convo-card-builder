@@ -1,43 +1,102 @@
 import { Router } from 'express';
 import crypto from 'crypto';
-import db from '../db/index.js';
 import {
   generatePKCE,
   getAuthUrl,
   exchangeCode,
   refreshAccessToken,
+  revokeOAuth2Token,
   getMe,
-  getAdAccounts,
+  listAdAccounts,
   getAccountFeatures,
   getOAuth1RequestToken,
   getOAuth1AuthorizeUrl,
   exchangeOAuth1Token,
 } from '../lib/xClient.js';
+import { safeEqual } from '../lib/crypto.js';
+import {
+  getUser,
+  upsertOAuth2User,
+  updateOAuth2Tokens,
+  setOAuth1,
+  setAdAccountId,
+  clearUserTokens,
+  getUserTokens,
+} from '../lib/users.js';
+import {
+  requireAuth,
+  saveSession,
+  regenerateSession,
+  destroySession,
+} from '../lib/session.js';
 
 const router = Router();
 
+const refreshInflight = new Map();
+
+function clientUrl() {
+  return process.env.CLIENT_URL || 'http://localhost:5173';
+}
+
+async function establishSession(req, userId) {
+  await regenerateSession(req);
+  req.session.userId = userId;
+  await saveSession(req);
+}
+
+async function refreshUserTokens(user) {
+  const existing = refreshInflight.get(user.id);
+  if (existing) {
+    await existing;
+    return getUser(user.id);
+  }
+
+  const pending = (async () => {
+    const tokens = await refreshAccessToken(user.refresh_token);
+    const expiresAt = Date.now() + tokens.expires_in * 1000;
+    updateOAuth2Tokens(user.id, tokens.access_token, tokens.refresh_token, expiresAt);
+  })();
+
+  refreshInflight.set(user.id, pending);
+  try {
+    await pending;
+  } finally {
+    refreshInflight.delete(user.id);
+  }
+  return getUser(user.id);
+}
+
 // --- OAuth 2.0 flow (basic user auth) ---
 
-router.get('/auth/login', (req, res) => {
+router.get('/auth/login', async (req, res) => {
   const state = crypto.randomBytes(16).toString('hex');
   const { verifier, challenge } = generatePKCE();
 
   req.session.oauthState = state;
   req.session.codeVerifier = verifier;
 
-  const url = getAuthUrl(state, challenge);
-  res.redirect(url);
+  try {
+    await saveSession(req);
+    res.redirect(getAuthUrl(state, challenge));
+  } catch (err) {
+    console.error('Failed to persist login session:', err);
+    res.redirect(`${clientUrl()}?error=auth_failed`);
+  }
 });
 
 router.get('/auth/callback', async (req, res) => {
-  const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+  const origin = clientUrl();
 
   // --- OAuth 1.0a callback (Ads account connection) ---
   if (req.query.oauth_token && req.query.oauth_verifier) {
     const { oauth_token, oauth_verifier } = req.query;
 
     if (!req.session?.userId) {
-      return res.redirect(`${clientUrl}/dashboard?error=ads_auth_failed`);
+      return res.redirect(`${origin}/dashboard?error=ads_auth_failed`);
+    }
+
+    if (!safeEqual(String(oauth_token), String(req.session.oauth1Token || ''))) {
+      return res.redirect(`${origin}/dashboard?error=ads_auth_failed`);
     }
 
     try {
@@ -47,33 +106,34 @@ router.get('/auth/callback', async (req, res) => {
         oauth_verifier
       );
 
-      delete req.session.oauth1TokenSecret;
-
-      // Fetch the user's ad accounts using their own tokens
+      const userId = req.session.userId;
       const userTokens = {
         accessToken: result.accessToken,
         accessTokenSecret: result.accessTokenSecret,
       };
-      const adAccountId = await getAdAccounts(userTokens);
+
+      const accounts = await listAdAccounts(userTokens);
+      const adAccountId = accounts.length === 1 ? accounts[0].id : null;
       if (adAccountId) {
         await getAccountFeatures(adAccountId, userTokens);
       }
 
-      // Store user's OAuth 1.0a tokens and ad account
-      db.prepare(`
-        UPDATE users SET
-          oauth1_access_token = ?,
-          oauth1_access_token_secret = ?,
-          ad_account_id = ?
-        WHERE id = ?
-      `).run(result.accessToken, result.accessTokenSecret, adAccountId, req.session.userId);
+      setOAuth1(userId, result.accessToken, result.accessTokenSecret, adAccountId);
 
-      console.log('[Auth] OAuth 1.0a connected for user', req.session.userId, 'ad account:', adAccountId);
+      await establishSession(req, userId);
 
-      res.redirect(`${clientUrl}/dashboard?ads_connected=true`);
+      console.log('[Auth] OAuth 1.0a connected for user', userId, 'ad account:', adAccountId);
+
+      if (accounts.length === 0) {
+        return res.redirect(`${origin}/dashboard?error=no_ads_account`);
+      }
+      if (!adAccountId) {
+        return res.redirect(`${origin}/dashboard?select_ads=true`);
+      }
+      res.redirect(`${origin}/dashboard?ads_connected=true`);
     } catch (err) {
       console.error('OAuth 1.0a callback error:', err);
-      res.redirect(`${clientUrl}/dashboard?error=ads_auth_failed`);
+      res.redirect(`${origin}/dashboard?error=ads_auth_failed`);
     }
     return;
   }
@@ -82,82 +142,118 @@ router.get('/auth/callback', async (req, res) => {
   const { code, state, error } = req.query;
 
   if (error) {
-    return res.redirect(`${clientUrl}?error=${encodeURIComponent(error)}`);
+    return res.redirect(`${origin}?error=${encodeURIComponent(error)}`);
   }
 
-  if (!code || state !== req.session.oauthState) {
-    return res.redirect(`${clientUrl}?error=invalid_state`);
+  if (!code || !state || !req.session.oauthState || !safeEqual(String(state), String(req.session.oauthState))) {
+    return res.redirect(`${origin}?error=invalid_state`);
   }
 
   try {
     const tokens = await exchangeCode(code, req.session.codeVerifier);
     const user = await getMe(tokens.access_token);
-
     const expiresAt = Date.now() + tokens.expires_in * 1000;
 
-    const upsert = db.prepare(`
-      INSERT INTO users (id, username, display_name, profile_image_url, access_token, refresh_token, token_expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        username = excluded.username,
-        display_name = excluded.display_name,
-        profile_image_url = excluded.profile_image_url,
-        access_token = excluded.access_token,
-        refresh_token = excluded.refresh_token,
-        token_expires_at = excluded.token_expires_at
-    `);
+    upsertOAuth2User(user, tokens.access_token, tokens.refresh_token, expiresAt);
+    await establishSession(req, user.id);
 
-    upsert.run(
-      user.id,
-      user.username,
-      user.name,
-      user.profile_image_url,
-      tokens.access_token,
-      tokens.refresh_token,
-      expiresAt
-    );
-
-    delete req.session.oauthState;
-    delete req.session.codeVerifier;
-    req.session.userId = user.id;
-
-    res.redirect(`${clientUrl}/dashboard`);
+    res.redirect(`${origin}/dashboard`);
   } catch (err) {
     console.error('OAuth callback error:', err);
-    res.redirect(`${clientUrl}?error=auth_failed`);
+    res.redirect(`${origin}?error=auth_failed`);
   }
 });
 
 // --- OAuth 1.0a 3-legged flow (Ads API access) ---
 
-router.get('/auth/ads/login', (req, res) => {
+router.get('/auth/ads/login', async (req, res) => {
   if (!req.session?.userId) {
     return res.status(401).json({ error: 'Must be logged in first' });
   }
 
-  const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
-  const callbackUrl = `${clientUrl}/auth/callback`;
+  const origin = clientUrl();
+  const callbackUrl = process.env.X_REDIRECT_URI;
 
-  getOAuth1RequestToken(callbackUrl)
-    .then(({ oauthToken, oauthTokenSecret }) => {
-      req.session.oauth1TokenSecret = oauthTokenSecret;
-      res.redirect(getOAuth1AuthorizeUrl(oauthToken));
-    })
-    .catch((err) => {
-      console.error('OAuth 1.0a request token error:', err);
-      res.redirect(`${clientUrl}/dashboard?error=ads_auth_failed`);
-    });
+  try {
+    const { oauthToken, oauthTokenSecret } = await getOAuth1RequestToken(callbackUrl);
+    req.session.oauth1Token = oauthToken;
+    req.session.oauth1TokenSecret = oauthTokenSecret;
+    await saveSession(req);
+    res.redirect(getOAuth1AuthorizeUrl(oauthToken));
+  } catch (err) {
+    console.error('OAuth 1.0a request token error:', err);
+    res.redirect(`${origin}/dashboard?error=ads_auth_failed`);
+  }
+});
+
+router.get('/auth/ads/accounts', requireAuth, async (req, res) => {
+  try {
+    const user = getUser(req.session.userId);
+    const userTokens = getUserTokens(user);
+    if (!userTokens) {
+      return res.status(403).json({ error: 'Ads account not connected' });
+    }
+    const accounts = await listAdAccounts(userTokens);
+    res.json({ accounts, selectedId: user.ad_account_id || null });
+  } catch (err) {
+    console.error('Ads account list error:', err);
+    res.status(500).json({ error: 'Failed to load ads accounts' });
+  }
+});
+
+router.post('/auth/ads/account', requireAuth, async (req, res) => {
+  try {
+    const { adAccountId } = req.body || {};
+    if (!adAccountId) {
+      return res.status(400).json({ error: 'adAccountId is required' });
+    }
+
+    const user = getUser(req.session.userId);
+    const userTokens = getUserTokens(user);
+    if (!userTokens) {
+      return res.status(403).json({ error: 'Ads account not connected' });
+    }
+
+    const accounts = await listAdAccounts(userTokens);
+    if (!accounts.some((a) => a.id === adAccountId)) {
+      return res.status(400).json({ error: 'Invalid ads account' });
+    }
+
+    setAdAccountId(user.id, adAccountId);
+    await getAccountFeatures(adAccountId, userTokens);
+    res.json({ ok: true, adAccountId });
+  } catch (err) {
+    console.error('Ads account select error:', err);
+    res.status(500).json({ error: 'Failed to select ads account' });
+  }
 });
 
 // --- Session ---
 
-router.post('/auth/logout', (req, res) => {
-  req.session.destroy((err) => {
-    if (err) {
-      return res.status(500).json({ error: 'Failed to logout' });
+router.post('/auth/logout', async (req, res) => {
+  const userId = req.session?.userId;
+  try {
+    if (userId) {
+      const user = getUser(userId);
+      if (user?.refresh_token) {
+        try {
+          await revokeOAuth2Token(user.refresh_token);
+        } catch (err) {
+          console.error('Token revoke error:', err);
+        }
+      }
+      clearUserTokens(userId);
     }
+  } catch (err) {
+    console.error('Logout cleanup error:', err);
+  }
+
+  try {
+    await destroySession(req, res);
     res.json({ ok: true });
-  });
+  } catch {
+    res.status(500).json({ error: 'Failed to logout' });
+  }
 });
 
 router.get('/auth/me', async (req, res) => {
@@ -165,30 +261,27 @@ router.get('/auth/me', async (req, res) => {
     return res.status(401).json({ error: 'Not authenticated' });
   }
 
-  const user = db
-    .prepare('SELECT id, username, display_name, profile_image_url, ad_account_id, oauth1_access_token, refresh_token, token_expires_at FROM users WHERE id = ?')
-    .get(req.session.userId);
-
+  let user = getUser(req.session.userId);
   if (!user) {
+    try { await destroySession(req, res); } catch { /* ignore */ }
     return res.status(401).json({ error: 'User not found' });
   }
 
-  // Refresh OAuth 2.0 token if expired (5-minute buffer)
   const FIVE_MINUTES = 5 * 60 * 1000;
   if (user.token_expires_at && user.token_expires_at < Date.now() + FIVE_MINUTES) {
     if (!user.refresh_token) {
-      req.session.destroy(() => {});
+      try { await destroySession(req, res); } catch { /* ignore */ }
       return res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
 
     try {
-      const tokens = await refreshAccessToken(user.refresh_token);
-      const expiresAt = Date.now() + tokens.expires_in * 1000;
-      db.prepare(`
-        UPDATE users SET access_token = ?, refresh_token = ?, token_expires_at = ? WHERE id = ?
-      `).run(tokens.access_token, tokens.refresh_token, expiresAt, user.id);
-    } catch {
-      req.session.destroy(() => {});
+      user = await refreshUserTokens(user);
+    } catch (err) {
+      console.error('Token refresh error:', err);
+      try {
+        clearUserTokens(user.id);
+        await destroySession(req, res);
+      } catch { /* ignore */ }
       return res.status(401).json({ error: 'Session expired. Please log in again.' });
     }
   }
@@ -199,6 +292,7 @@ router.get('/auth/me', async (req, res) => {
     username: user.username,
     profileImageUrl: user.profile_image_url,
     adsConnected: !!(user.oauth1_access_token && user.ad_account_id),
+    needsAdsAccount: !!(user.oauth1_access_token && !user.ad_account_id),
   });
 });
 

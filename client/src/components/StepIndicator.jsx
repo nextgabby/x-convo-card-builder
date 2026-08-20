@@ -1,9 +1,7 @@
-const STEPS = ['Card Setup', 'Engagement Prompts', 'Publish'];
-
-export default function StepIndicator({ current = 0 }) {
+export default function StepIndicator({ current = 0, steps = ['Card Setup', 'Engagement Prompts', 'Publish'] }) {
   return (
     <div className="flex items-center gap-2 mb-8">
-      {STEPS.map((label, i) => (
+      {steps.map((label, i) => (
         <div key={label} className="flex items-center gap-2">
           <div className="flex items-center gap-2">
             <div
@@ -31,7 +29,7 @@ export default function StepIndicator({ current = 0 }) {
               {label}
             </span>
           </div>
-          {i < STEPS.length - 1 && (
+          {i < steps.length - 1 && (
             <div
               className={`w-8 h-px ${
                 i < current ? 'bg-x-blue' : 'bg-x-border'
